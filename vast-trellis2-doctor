@@ -1,0 +1,283 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="${VAST_TRELLIS_LIB_DIR:-/usr/local/lib/vast-trellis2}"
+if [[ -d "$SCRIPT_DIR/scripts" ]]; then TOOL_ROOT="$SCRIPT_DIR"; else TOOL_ROOT="$LIB_DIR"; fi
+PATCH_TOOL="$TOOL_ROOT/scripts/patch_trellis.py"
+
+WORKSPACE="${VAST_TRELLIS_BASE:-/workspace}"
+STATE_DIR="${VAST_TRELLIS_STATE_DIR:-$WORKSPACE/.vast-trellis2}"
+CONFIG_FILE="$STATE_DIR/config.env"
+LOG_DIR="$STATE_DIR/logs"
+REPO_DIR="${VAST_TRELLIS_REPO_DIR:-$WORKSPACE/TRELLIS.2}"
+ENV_NAME="${VAST_TRELLIS_ENV_NAME:-trellis2}"
+HF_HOME_DIR="${HF_HOME:-$WORKSPACE/huggingface}"
+
+c_reset='\033[0m'; c_bold='\033[1m'; c_green='\033[32m'; c_yellow='\033[33m'; c_red='\033[31m'; c_cyan='\033[36m'
+if [[ -n "${NO_COLOR:-}" ]]; then c_reset=''; c_bold=''; c_green=''; c_yellow=''; c_red=''; c_cyan=''; fi
+ok() { printf '%b✓ %s%b\n' "$c_green" "$*" "$c_reset"; }
+warn() { printf '%b! %s%b\n' "$c_yellow" "$*" "$c_reset" >&2; }
+fail() { printf '%b✗ %s%b\n' "$c_red" "$*" "$c_reset" >&2; }
+heading() { printf '\n%b== %s ==%b\n' "$c_bold" "$*" "$c_reset"; }
+
+FIX=0
+DEEP=0
+case "${1:-}" in
+  --fix) FIX=1 ;;
+  --check|"") ;;
+  --deep) DEEP=1 ;;
+  --help|-h)
+    cat <<'EOF'
+Vast TRELLIS.2 Doctor
+
+  vast-trellis2 doctor          Check only
+  vast-trellis2 doctor --check  Check only
+  vast-trellis2 doctor --fix    Apply safe automatic repairs
+  vast-trellis2 doctor --deep   Also instantiate DINOv3 through TRELLIS
+
+Auto-fix can:
+  - reapply local-DINO / Transformers compatibility patches
+  - restore missing HDRI EXR assets
+  - pin an EXR-capable OpenCV build
+  - reinstall the xFormers wheel matching the saved PyTorch CUDA index
+
+It cannot bypass gated-model licensing. DINOv3/RMBG access still requires your
+Hugging Face account, or an official local Meta DINOv3 checkpoint.
+EOF
+    exit 0
+    ;;
+  *) fail "Unknown option: ${1:-}"; exit 2 ;;
+esac
+
+mkdir -p "$STATE_DIR" "$LOG_DIR"
+if [[ -f "$CONFIG_FILE" ]]; then
+  # shellcheck disable=SC1090
+  source "$CONFIG_FILE"
+fi
+REPO_DIR="${REPO_DIR:-$WORKSPACE/TRELLIS.2}"
+ENV_NAME="${ENV_NAME:-trellis2}"
+HF_HOME_DIR="${HF_HOME_DIR:-$WORKSPACE/huggingface}"
+export HF_HOME="$HF_HOME_DIR"
+
+source_conda() {
+  if command -v conda >/dev/null 2>&1; then
+    local base; base="$(conda info --base 2>/dev/null || true)"
+    [[ -n "$base" && -f "$base/etc/profile.d/conda.sh" ]] && source "$base/etc/profile.d/conda.sh"
+    return 0
+  fi
+  local candidate
+  for candidate in /opt/conda /opt/miniforge3 /venv/miniforge3 "$STATE_DIR/miniforge3"; do
+    [[ -f "$candidate/etc/profile.d/conda.sh" ]] && { source "$candidate/etc/profile.d/conda.sh"; return 0; }
+  done
+  return 1
+}
+
+meminfo_bytes() { awk -v k="$1" '$1==k":" {printf "%.0f", $2*1024}' /proc/meminfo; }
+cgroup_limit() {
+  local total="$(meminfo_bytes MemTotal)" v
+  if [[ -r /sys/fs/cgroup/memory.max ]]; then
+    v="$(cat /sys/fs/cgroup/memory.max)"
+    if [[ "$v" =~ ^[0-9]+$ ]] && (( v < total )); then printf '%s' "$v"; return; fi
+  fi
+  printf '%s' "$total"
+}
+human_gib() { awk -v b="$1" 'BEGIN {printf "%.1f GiB", b/1073741824}'; }
+
+PROBLEMS=0
+problem() { ((PROBLEMS+=1)); fail "$*"; }
+
+heading "GPU / CUDA"
+if command -v nvidia-smi >/dev/null 2>&1; then
+  nvidia-smi --query-gpu=index,name,memory.total,compute_cap,driver_version --format=csv 2>/dev/null || nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv 2>/dev/null || true
+  ok "NVIDIA runtime visible."
+else
+  problem "nvidia-smi is missing. This container was not started with an NVIDIA GPU runtime."
+fi
+
+if [[ -n "${CUDA_HOME_SELECTED:-}" && -x "${CUDA_HOME_SELECTED}/bin/nvcc" ]]; then
+  "${CUDA_HOME_SELECTED}/bin/nvcc" --version | tail -n2
+  ok "Saved CUDA_HOME is valid: $CUDA_HOME_SELECTED"
+elif command -v nvcc >/dev/null 2>&1; then
+  nvcc --version | tail -n2
+  warn "Saved CUDA_HOME is absent, but nvcc exists in PATH. Re-run 'vast-trellis2 detect/install' to refresh config."
+else
+  problem "CUDA Toolkit/nvcc is missing. TRELLIS custom CUDA extensions cannot be built."
+fi
+
+heading "RAM / cgroup"
+printf 'Host MemTotal:      %s\n' "$(human_gib "$(meminfo_bytes MemTotal)")"
+printf 'Effective RAM cap:  %s\n' "$(human_gib "$(cgroup_limit)")"
+free -h || true
+if [[ -r /sys/fs/cgroup/memory.events ]]; then
+  cat /sys/fs/cgroup/memory.events
+  if grep -qE '^oom_kill[[:space:]]+[1-9][0-9]*$' /sys/fs/cgroup/memory.events; then
+    warn "This container has recorded cgroup OOM kills. A bare 'Killed' from Python is consistent with system RAM exhaustion."
+  fi
+fi
+if (( $(cgroup_limit) < 51539607552 )); then
+  warn "Effective RAM is below 48 GiB. 64 GiB+ is strongly recommended."
+fi
+
+heading "Disk"
+df -h "$WORKSPACE" || true
+free_kb="$(df -Pk "$WORKSPACE" | awk 'NR==2 {print $4}')"
+if [[ "$free_kb" =~ ^[0-9]+$ ]] && (( free_kb < 31457280 )); then
+  problem "Less than 30 GiB free in $WORKSPACE; model caches/builds may fail."
+else
+  ok "Workspace disk has usable headroom."
+fi
+
+heading "TRELLIS source / patches"
+if [[ -f "$REPO_DIR/app.py" && -f "$REPO_DIR/trellis2/modules/image_feature_extractor.py" ]]; then
+  ok "TRELLIS.2 checkout: $REPO_DIR"
+  if grep -q DINOV3_MODEL_PATH "$REPO_DIR/trellis2/modules/image_feature_extractor.py" && grep -q 'self.model.model.layer' "$REPO_DIR/trellis2/modules/image_feature_extractor.py"; then
+    ok "DINOv3 compatibility patch present."
+  else
+    problem "DINOv3 compatibility patch missing."
+    if (( FIX == 1 )); then
+      python3 "$PATCH_TOOL" "$REPO_DIR" && ok "Compatibility patch reapplied."
+    fi
+  fi
+else
+  problem "TRELLIS.2 checkout not found at $REPO_DIR."
+fi
+
+if ! source_conda; then
+  problem "Conda/Miniforge not found."
+  echo "Run: vast-trellis2 wizard"
+else
+  if conda env list | awk '{print $1}' | grep -qx "$ENV_NAME"; then
+    conda activate "$ENV_NAME"
+    ok "Conda environment '$ENV_NAME' is available."
+  else
+    problem "Conda environment '$ENV_NAME' is missing."
+  fi
+fi
+
+if [[ "${CONDA_DEFAULT_ENV:-}" == "$ENV_NAME" ]]; then
+  heading "Python / CUDA extensions"
+  set +e
+  (cd "$REPO_DIR" && python - <<'PY'
+import importlib, sys
+mods = ["torch", "xformers", "o_voxel", "cumesh", "flex_gemm", "nvdiffrast.torch", "trellis2"]
+for m in mods:
+    try:
+        importlib.import_module(m)
+        print(f"OK {m}")
+    except Exception as e:
+        print(f"FAIL {m}: {type(e).__name__}: {e}")
+        sys.exit(10)
+import torch
+print("Torch", torch.__version__, "CUDA", torch.version.cuda)
+print("CUDA available", torch.cuda.is_available())
+if torch.cuda.is_available():
+    print("GPU", torch.cuda.get_device_name(0), "cap", torch.cuda.get_device_capability(0))
+PY
+  )
+  py_rc=$?
+  set -e
+  if (( py_rc == 0 )); then ok "Core Python/CUDA imports succeed."; else problem "One or more Python/CUDA extensions failed to import."; fi
+
+  heading "xFormers"
+  if python -m xformers.info >"$LOG_DIR/doctor-xformers.log" 2>&1 && ! grep -qiE "can't load|not built with CUDA" "$LOG_DIR/doctor-xformers.log"; then
+    ok "xFormers CUDA extensions load."
+  else
+    problem "xFormers is mismatched or its CUDA extensions do not load."
+    tail -n 25 "$LOG_DIR/doctor-xformers.log" 2>/dev/null || true
+    if (( FIX == 1 )) && [[ -n "${TORCH_INDEX:-}" ]]; then
+      python -m pip install -U xformers --index-url "$TORCH_INDEX" && ok "xFormers reinstalled from $TORCH_INDEX"
+    fi
+  fi
+
+  heading "OpenEXR / HDRI"
+  if (( FIX == 1 )); then
+    python -m pip install -U "opencv-python-headless==4.12.0.88"
+    base="https://raw.githubusercontent.com/microsoft/TRELLIS.2/main/assets/hdri"
+    mkdir -p "$REPO_DIR/assets/hdri"
+    for f in forest sunset courtyard; do
+      if [[ ! -s "$REPO_DIR/assets/hdri/$f.exr" || $(stat -c%s "$REPO_DIR/assets/hdri/$f.exr" 2>/dev/null || echo 0) -lt 10000 ]]; then
+        curl -fL "$base/$f.exr" -o "$REPO_DIR/assets/hdri/$f.exr"
+      fi
+    done
+  fi
+  set +e
+  OPENCV_IO_ENABLE_OPENEXR=1 python - "$REPO_DIR" <<'PY'
+import os,sys,cv2
+repo=sys.argv[1]
+for n in ("forest","sunset","courtyard"):
+    p=os.path.join(repo,"assets","hdri",n+".exr")
+    im=cv2.imread(p,cv2.IMREAD_UNCHANGED)
+    print(n, None if im is None else im.shape)
+    if im is None: sys.exit(11)
+PY
+  exr_rc=$?
+  set -e
+  if (( exr_rc == 0 )); then ok "OpenCV can read all required EXR HDRIs."; else problem "OpenCV/HDRI EXR loading failed."; fi
+
+  heading "Hugging Face identity / gated dependencies"
+  if command -v hf >/dev/null 2>&1 && hf auth whoami >/dev/null 2>&1; then
+    hf auth whoami || true
+    ok "Hugging Face token is available."
+  else
+    warn "No working Hugging Face login detected. Run: vast-trellis2 auth"
+  fi
+
+  if [[ -n "${DINOV3_MODEL_PATH:-}" ]]; then
+    if [[ -f "$DINOV3_MODEL_PATH/config.json" ]]; then ok "Local DINOv3 configured: $DINOV3_MODEL_PATH"; else problem "DINOV3_MODEL_PATH is configured but invalid: $DINOV3_MODEL_PATH"; fi
+  else
+    set +e
+    python - <<'PY' >/dev/null 2>"$LOG_DIR/doctor-dino.err"
+from huggingface_hub import hf_hub_download
+hf_hub_download("facebook/dinov3-vitl16-pretrain-lvd1689m","config.json")
+PY
+    dino_rc=$?
+    set -e
+    if (( dino_rc == 0 )); then ok "DINOv3 Hugging Face access works."; else warn "DINOv3 HF access is gated/pending. Use 'vast-trellis2 dino-local PATH' if you have Meta's official checkpoint."; fi
+  fi
+
+  set +e
+  python - <<'PY' >/dev/null 2>"$LOG_DIR/doctor-rmbg.err"
+from huggingface_hub import hf_hub_download
+hf_hub_download("briaai/RMBG-2.0","config.json")
+PY
+  rmbg_rc=$?
+  set -e
+  if (( rmbg_rc == 0 )); then ok "RMBG-2.0 Hugging Face access works."; else warn "RMBG-2.0 is gated for this account. Accept/request access, then run 'vast-trellis2 auth'."; fi
+
+  if (( DEEP == 1 )); then
+    heading "Deep DINOv3/TRELLIS feature-extractor test"
+    export ATTN_BACKEND="${ATTN_BACKEND:-xformers}"
+    export SPARSE_ATTN_BACKEND="${SPARSE_ATTN_BACKEND:-xformers}"
+    [[ -n "${DINOV3_MODEL_PATH:-}" ]] && export DINOV3_MODEL_PATH
+    (cd "$REPO_DIR" && python - <<'PY'
+from trellis2.modules.image_feature_extractor import DinoV3FeatureExtractor
+DinoV3FeatureExtractor("facebook/dinov3-vitl16-pretrain-lvd1689m")
+print("DINOv3 through TRELLIS: OK")
+PY
+    )
+  fi
+fi
+
+heading "Recent runtime crash"
+if [[ -f "$LOG_DIR/runtime.log" ]]; then
+  if tail -n 100 "$LOG_DIR/runtime.log" | grep -qiE '^Killed$|CUDA out of memory|GatedRepoError|object has no attribute .layer|cvtColor.*!_src.empty|ModuleNotFoundError'; then
+    warn "A known crash signature exists in runtime.log. Run: vast-trellis2 explain"
+    tail -n 20 "$LOG_DIR/runtime.log"
+  else
+    ok "No known crash signature in the last runtime log tail."
+  fi
+else
+  echo "No runtime log yet."
+fi
+
+heading "Result"
+if (( PROBLEMS == 0 )); then
+  ok "Doctor found no blocking local installation problem."
+  exit 0
+fi
+warn "$PROBLEMS problem(s) detected."
+if (( FIX == 0 )); then
+  echo "Run 'vast-trellis2 doctor --fix' for safe automatic repairs where possible."
+fi
+exit 1
