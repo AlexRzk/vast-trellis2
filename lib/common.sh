@@ -148,14 +148,21 @@ fallback_cap_for_name() {
 detect_gpus() {
   GPU_NAMES=(); GPU_VRAM_MIB=(); GPU_CAPS=(); GPU_COUNT=0; MIN_VRAM_MIB=0; BLACKWELL=0
   command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found. Start a Vast.ai NVIDIA GPU instance."
-  local rows line idx name mem cap _driver cap_major
-  rows="$(nvidia-smi --query-gpu=index,name,memory.total,compute_cap,driver_version --format=csv,noheader,nounits 2>/dev/null || true)"
-  if [[ -z "$rows" ]]; then
+  local rows line idx name mem cap driver cap_major has_compute=0
+  if rows="$(nvidia-smi --query-gpu=index,name,memory.total,compute_cap,driver_version --format=csv,noheader,nounits 2>/dev/null)" && [[ -n "$rows" ]]; then
+    has_compute=1
+  else
     rows="$(nvidia-smi --query-gpu=index,name,memory.total,driver_version --format=csv,noheader,nounits 2>/dev/null || true)"
   fi
   [[ -n "$rows" ]] || die "NVIDIA runtime is present but no GPU is visible."
+
   while IFS= read -r line; do
-    IFS=',' read -r idx name mem cap _driver <<< "$line"
+    if (( has_compute == 1 )); then
+      IFS=',' read -r idx name mem cap driver <<< "$line"
+    else
+      IFS=',' read -r idx name mem driver <<< "$line"
+      cap=''
+    fi
     idx="$(xargs <<<"${idx:-}")"; name="$(xargs <<<"${name:-unknown}")"; mem="$(xargs <<<"${mem:-0}")"; cap="$(xargs <<<"${cap:-}")"
     if [[ ! "$cap" =~ ^[0-9]+\.[0-9]+$ ]]; then cap="$(fallback_cap_for_name "$name")"; fi
     GPU_NAMES+=("$name"); GPU_VRAM_MIB+=("${mem%.*}"); GPU_CAPS+=("$cap"); ((GPU_COUNT+=1))
@@ -230,8 +237,10 @@ recommend_settings() {
   ARCH_LIST="$joined"
   ATTN_BACKEND="xformers"; SPARSE_ATTN_BACKEND="xformers"
 
-  if (( MIN_VRAM_MIB >= 65536 )); then LOW_VRAM=0; else LOW_VRAM=1; fi
-  if (( MIN_VRAM_MIB >= 32768 && limit_gib >= 64 )); then DEFAULT_RESOLUTION=1024; else DEFAULT_RESOLUTION=512; fi
+  local runtime_vram="$MIN_VRAM_MIB"
+  if [[ "$GPU_ID" =~ ^[0-9]+$ ]] && (( GPU_ID < GPU_COUNT )); then runtime_vram="${GPU_VRAM_MIB[$GPU_ID]}"; fi
+  if (( runtime_vram >= 65536 )); then LOW_VRAM=0; else LOW_VRAM=1; fi
+  if (( runtime_vram >= 32768 && limit_gib >= 64 )); then DEFAULT_RESOLUTION=1024; else DEFAULT_RESOLUTION=512; fi
 }
 
 load_config() {
