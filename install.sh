@@ -12,6 +12,7 @@ required=(
   "$ROOT_DIR/lib/install.sh"
   "$ROOT_DIR/lib/download.sh"
   "$ROOT_DIR/lib/runtime.sh"
+  "$ROOT_DIR/lib/lifecycle.sh"
   "$ROOT_DIR/scripts/patch_trellis.py"
   "$ROOT_DIR/scripts/convert_dinov3_local.py"
 )
@@ -26,6 +27,7 @@ install -m 0644 "$ROOT_DIR/lib/common.sh" "$LIB_DIR/lib/common.sh"
 install -m 0644 "$ROOT_DIR/lib/install.sh" "$LIB_DIR/lib/install.sh"
 install -m 0644 "$ROOT_DIR/lib/download.sh" "$LIB_DIR/lib/download.sh"
 install -m 0644 "$ROOT_DIR/lib/runtime.sh" "$LIB_DIR/lib/runtime.sh"
+install -m 0644 "$ROOT_DIR/lib/lifecycle.sh" "$LIB_DIR/lib/lifecycle.sh"
 install -m 0755 "$ROOT_DIR/scripts/patch_trellis.py" "$LIB_DIR/scripts/patch_trellis.py"
 install -m 0755 "$ROOT_DIR/scripts/convert_dinov3_local.py" "$LIB_DIR/scripts/convert_dinov3_local.py"
 
@@ -53,9 +55,12 @@ Useful commands:
   vast-trellis2 hf-speedtest
   vast-trellis2 run
   vast-trellis2 start
+  vast-trellis2 stop
   vast-trellis2 status
   vast-trellis2 tunnel
 
 The wizard detects effective cgroup RAM (not just host RAM), GPU VRAM/compute
 capability, CUDA Toolkit, CPU count and safe CUDA build concurrency.
+The lifecycle manager also discovers orphaned TRELLIS app.py processes so old
+GPU/RAM-heavy servers can be stopped even if their original PID file was lost.
 EOF
