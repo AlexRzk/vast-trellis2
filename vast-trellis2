@@ -11,7 +11,7 @@ else
   TOOL_ROOT="$LIB_DIR"
 fi
 
-for f in common.sh install.sh download.sh runtime.sh; do
+for f in common.sh install.sh download.sh runtime.sh lifecycle.sh; do
   [[ -f "$TOOL_ROOT/lib/$f" ]] || { echo "ERROR: missing $TOOL_ROOT/lib/$f. Re-run install.sh." >&2; exit 1; }
 done
 
@@ -24,6 +24,9 @@ source "$TOOL_ROOT/lib/install.sh"
 source "$TOOL_ROOT/lib/download.sh"
 # shellcheck disable=SC1091
 source "$TOOL_ROOT/lib/runtime.sh"
+# Loaded last so robust process discovery overrides the basic PID-file-only lifecycle.
+# shellcheck disable=SC1091
+source "$TOOL_ROOT/lib/lifecycle.sh"
 
 # Direct repository execution uses the long source filename; installed layout uses
 # /usr/local/lib/vast-trellis2/vast-trellis-doctor.
