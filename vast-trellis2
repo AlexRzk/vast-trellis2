@@ -1,0 +1,430 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+APP=vast-trellis2
+BASE="${VAST_TRELLIS_BASE:-/workspace}"
+[[ -d "$BASE" && -w "$BASE" ]] || BASE="$HOME"
+STATE_DIR="${VAST_TRELLIS_STATE_DIR:-$BASE/.vast-trellis2}"
+TRELLIS_DIR="${TRELLIS_DIR:-$BASE/TRELLIS.2}"
+VENV="${TRELLIS_VENV:-$BASE/.venvs/trellis2}"
+HF_HOME="${HF_HOME:-$BASE/huggingface}"
+CONFIG="$STATE_DIR/config.env"
+TOKEN_FILE="$STATE_DIR/hf_token"
+LOG_DIR="$STATE_DIR/logs"
+STAGE_DIR="$STATE_DIR/stages"
+FAIL_FILE="$STATE_DIR/last_failure.env"
+PID_FILE="$STATE_DIR/app.pid"
+APP_LOG="$LOG_DIR/app.log"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" "$STAGE_DIR" "$HF_HOME" "$(dirname "$VENV")"
+
+C0='\033[0m'; CB='\033[1m'; CG='\033[32m'; CY='\033[33m'; CR='\033[31m'; CC='\033[36m'
+[[ -n "${NO_COLOR:-}" ]] && C0='' CB='' CG='' CY='' CR='' CC=''
+info(){ printf '%b%s%b\n' "$CC" "$*" "$C0"; }
+ok(){ printf '%b%s%b\n' "$CG" "$*" "$C0"; }
+warn(){ printf '%b%s%b\n' "$CY" "$*" "$C0" >&2; }
+die(){ printf '%bERROR: %s%b\n' "$CR" "$*" "$C0" >&2; exit 1; }
+section(){ printf '\n%b== %s ==%b\n' "$CB" "$*" "$C0"; }
+
+usage(){ cat <<'EOF'
+Vast.ai TRELLIS.2 Wizard
+
+Usage:
+  vast-trellis2 wizard
+  vast-trellis2 detect
+  vast-trellis2 show
+  vast-trellis2 install [--force]
+  vast-trellis2 download
+  vast-trellis2 launch
+  vast-trellis2 status
+  vast-trellis2 logs
+  vast-trellis2 doctor
+  vast-trellis2 repair
+  vast-trellis2 reset-build
+  vast-trellis2 help
+EOF
+}
+
+prompt(){ local l="$1" d="${2:-}" v; if [[ -n "$d" ]]; then read -r -p "$l [$d]: " v || true; printf '%s' "${v:-$d}"; else read -r -p "$l: " v || true; printf '%s' "$v"; fi; }
+yesno(){ local l="$1" d="${2:-y}" a h='y/N'; [[ "$d" == y ]] && h='Y/n'; read -r -p "$l [$h]: " a || true; a="${a:-$d}"; [[ "$a" =~ ^[Yy]$ ]]; }
+
+ram_total_gb(){ awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo; }
+ram_avail_gb(){ awk '/MemAvailable/{printf "%d", $2/1024/1024}' /proc/meminfo; }
+cpu_count(){ nproc 2>/dev/null || echo 1; }
+disk_free_gb(){ df -Pk "$BASE" | awk 'NR==2{printf "%d", $4/1024/1024}'; }
+gpu_count(){ nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l | tr -d ' '; }
+gpu_name(){ nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 | sed 's/^ *//;s/ *$//'; }
+gpu_vram_mb(){ nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1 | tr -d ' '; }
+gpu_cc(){ nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+driver_ver(){ nvidia-smi --query-gpu=driver_version --format=csv,noheader 2>/dev/null | head -1 | tr -d ' '; }
+host_cuda(){ nvidia-smi 2>/dev/null | sed -n 's/.*CUDA Version: *\([0-9.]*\).*/\1/p' | head -1; }
+nvcc_cuda(){ nvcc --version 2>/dev/null | sed -n 's/.*release \([0-9.]*\),.*/\1/p' | head -1; }
+
+version_ge(){ python3 - "$1" "$2" <<'PY'
+import sys
+from packaging.version import Version
+sys.exit(0 if Version(sys.argv[1]) >= Version(sys.argv[2]) else 1)
+PY
+}
+
+compute_defaults(){
+  command -v nvidia-smi >/dev/null 2>&1 || die "nvidia-smi not found. No NVIDIA GPU is visible."
+  local avail cpu cc hc
+  avail="$(ram_avail_gb)"; cpu="$(cpu_count)"; cc="$(gpu_cc)"; hc="$(host_cuda)"
+  [[ -n "$cc" ]] || cc="unknown"
+
+  if (( avail < 16 )); then AUTO_JOBS=1
+  elif (( avail < 32 )); then AUTO_JOBS=2
+  elif (( avail < 64 )); then AUTO_JOBS=4
+  else AUTO_JOBS=6; fi
+  (( AUTO_JOBS > cpu )) && AUTO_JOBS="$cpu"
+  (( AUTO_JOBS < 1 )) && AUTO_JOBS=1
+
+  BLACKWELL=0
+  if [[ "$cc" =~ ^12\. ]]; then BLACKWELL=1; fi
+  FLASH_JOBS="$AUTO_JOBS"
+  if (( BLACKWELL )); then (( FLASH_JOBS > 2 )) && FLASH_JOBS=2; fi
+  (( avail < 24 )) && FLASH_JOBS=1
+
+  TORCH_INDEX="https://download.pytorch.org/whl/cu124"
+  if [[ -n "$hc" ]] && version_ge "$hc" 12.8 2>/dev/null; then TORCH_INDEX="https://download.pytorch.org/whl/cu128"; fi
+  if (( BLACKWELL )); then TORCH_INDEX="https://download.pytorch.org/whl/cu128"; fi
+
+  AUTO_ATTN="flash_attn"
+  (( BLACKWELL )) && AUTO_ATTN="xformers"
+  ARCH_LIST="$cc"
+}
+
+load_config(){
+  compute_defaults
+  MAX_JOBS_CFG="${MAX_JOBS:-$AUTO_JOBS}"
+  FLASH_JOBS_CFG="$FLASH_JOBS"
+  TORCH_INDEX_CFG="$TORCH_INDEX"
+  ATTN_CFG="${ATTN_BACKEND:-$AUTO_ATTN}"
+  ARCH_CFG="${TORCH_CUDA_ARCH_LIST:-$ARCH_LIST}"
+  PYTHON_CFG="3.10"
+  MODEL_REPO="microsoft/TRELLIS.2-4B"
+  PORT="7860"
+  INSTALL_FLASH="0"
+  [[ "$ATTN_CFG" == flash_attn ]] && INSTALL_FLASH=1
+  [[ -f "$CONFIG" ]] && source "$CONFIG"
+  MAX_JOBS_CFG="${MAX_JOBS:-$MAX_JOBS_CFG}"
+  ARCH_CFG="${TORCH_CUDA_ARCH_LIST:-$ARCH_CFG}"
+  ATTN_CFG="${ATTN_BACKEND:-$ATTN_CFG}"
+}
+
+save_config(){
+  umask 077
+  cat > "$CONFIG" <<EOF
+MAX_JOBS_CFG=$(printf '%q' "$MAX_JOBS_CFG")
+FLASH_JOBS_CFG=$(printf '%q' "$FLASH_JOBS_CFG")
+TORCH_INDEX_CFG=$(printf '%q' "$TORCH_INDEX_CFG")
+ATTN_CFG=$(printf '%q' "$ATTN_CFG")
+ARCH_CFG=$(printf '%q' "$ARCH_CFG")
+PYTHON_CFG=$(printf '%q' "$PYTHON_CFG")
+MODEL_REPO=$(printf '%q' "$MODEL_REPO")
+PORT=$(printf '%q' "$PORT")
+INSTALL_FLASH=$(printf '%q' "$INSTALL_FLASH")
+EOF
+}
+
+cmd_detect(){
+  compute_defaults
+  local vm=$(( $(gpu_vram_mb 2>/dev/null || echo 0) / 1024 ))
+  section "Detected machine"
+  printf 'GPU:                  %s\n' "$(gpu_name)"
+  printf 'GPU count:            %s\n' "$(gpu_count)"
+  printf 'VRAM / GPU:           %s GB\n' "$vm"
+  printf 'Compute capability:   %s\n' "$(gpu_cc)"
+  printf 'Driver:               %s\n' "$(driver_ver)"
+  printf 'Driver CUDA support:  %s\n' "$(host_cuda)"
+  printf 'nvcc toolkit:         %s\n' "$(nvcc_cuda || true)"
+  printf 'System RAM:           %s GB\n' "$(ram_total_gb)"
+  printf 'Available RAM:        %s GB\n' "$(ram_avail_gb)"
+  printf 'CPU threads:          %s\n' "$(cpu_count)"
+  printf 'Free disk:            %s GB\n' "$(disk_free_gb)"
+  echo
+  printf 'Recommended jobs:     %s\n' "$AUTO_JOBS"
+  printf 'Flash-attn jobs:      %s\n' "$FLASH_JOBS"
+  printf 'CUDA arch list:       %s\n' "$ARCH_LIST"
+  printf 'PyTorch index:        %s\n' "$TORCH_INDEX"
+  printf 'Attention backend:    %s\n' "$AUTO_ATTN"
+  if (( vm < 24 )); then warn "TRELLIS.2 documents >=24 GB VRAM; this GPU has about ${vm} GB."; fi
+  if [[ -z "$(nvcc_cuda || true)" ]]; then warn "nvcc is missing. CUDA extensions need a toolkit/devel image, not only a runtime image."; fi
+}
+
+cmd_show(){
+  load_config
+  section "Configuration"
+  printf 'TRELLIS directory: %s\nVenv:              %s\nHF home:           %s\n' "$TRELLIS_DIR" "$VENV" "$HF_HOME"
+  printf 'Build jobs:        %s\nFlash jobs:        %s\nTorch index:       %s\n' "$MAX_JOBS_CFG" "$FLASH_JOBS_CFG" "$TORCH_INDEX_CFG"
+  printf 'CUDA arch:         %s\nAttention backend: %s\nInstall flash:     %s\n' "$ARCH_CFG" "$ATTN_CFG" "$INSTALL_FLASH"
+  printf 'Model:             %s\nPort:              %s\n' "$MODEL_REPO" "$PORT"
+  printf 'HF token:          %s\n' "$([[ -s "$TOKEN_FILE" ]] && echo configured || echo not-configured)"
+}
+
+save_token_interactive(){
+  local t
+  printf 'Paste Hugging Face token (input hidden; blank keeps existing): '
+  read -r -s t || true; echo
+  if [[ -n "$t" ]]; then umask 077; printf '%s' "$t" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; ok "Hugging Face token saved securely."; fi
+}
+
+cmd_wizard(){
+  cmd_detect
+  load_config
+  section "Wizard"
+  MAX_JOBS_CFG="$(prompt 'Parallel jobs for CUDA extension builds' "$MAX_JOBS_CFG")"
+  FLASH_JOBS_CFG="$(prompt 'Parallel jobs for flash-attn builds' "$FLASH_JOBS_CFG")"
+  TORCH_INDEX_CFG="$(prompt 'PyTorch wheel index' "$TORCH_INDEX_CFG")"
+  ARCH_CFG="$(prompt 'TORCH_CUDA_ARCH_LIST' "$ARCH_CFG")"
+  echo
+  echo "Attention backend choices: xformers (safest on Blackwell), flash_attn, flash_attn_3"
+  ATTN_CFG="$(prompt 'Attention backend' "$ATTN_CFG")"
+  if [[ "$ATTN_CFG" == flash_attn* ]]; then INSTALL_FLASH=1; else INSTALL_FLASH=0; fi
+  PORT="$(prompt 'Gradio port' "$PORT")"
+  save_config
+  if yesno 'Configure a Hugging Face token now?' y; then save_token_interactive; fi
+  cmd_show
+  echo
+  if yesno 'Install TRELLIS.2 now?' y; then cmd_install; fi
+  if yesno 'Download TRELLIS.2-4B now?' y; then cmd_download; fi
+  if yesno 'Launch the web UI now?' y; then cmd_launch; fi
+}
+
+activate(){ [[ -x "$VENV/bin/python" ]] || die "Python environment missing. Run: $APP install"; export PATH="$VENV/bin:$PATH"; export HF_HOME; }
+
+mark_stage(){ touch "$STAGE_DIR/$1.ok"; }
+stage_done(){ [[ -f "$STAGE_DIR/$1.ok" ]]; }
+clear_failure(){ rm -f "$FAIL_FILE"; }
+record_failure(){ local stage="$1" log="$2" code="$3"; umask 077; cat > "$FAIL_FILE" <<EOF
+FAILED_STAGE=$(printf '%q' "$stage")
+FAILED_LOG=$(printf '%q' "$log")
+FAILED_CODE=$(printf '%q' "$code")
+EOF
+}
+
+explain_failure(){
+  local log="$1" code="${2:-1}"
+  echo
+  warn "Build failed (exit $code). Log: $log"
+  if grep -qiE 'Killed|out of memory|cannot allocate memory|exit code 137' "$log" 2>/dev/null || [[ "$code" == 137 ]]; then
+    warn "Diagnosis: likely system-RAM/container OOM. Run '$APP repair'; it will reduce build concurrency to 1."
+  elif grep -qiE 'unsupported gpu architecture|sm_120|compute_120' "$log" 2>/dev/null; then
+    warn "Diagnosis: the CUDA toolkit/package is too old for this GPU architecture (Blackwell sm_120). Use CUDA 12.8+ and a Blackwell-capable package."
+  elif grep -qiE 'nvcc.*not found|CUDA_HOME.*not set|No CUDA runtime is found' "$log" 2>/dev/null; then
+    warn "Diagnosis: CUDA toolkit compiler missing or CUDA_HOME incorrect. Use a CUDA devel/toolkit image."
+  elif grep -qiE 'CUDA driver version is insufficient|forward compatibility' "$log" 2>/dev/null; then
+    warn "Diagnosis: driver/container CUDA mismatch. Choose a toolkit supported by the host driver."
+  elif grep -qiE 'flash.?attn|flash_attn' "$log" 2>/dev/null; then
+    warn "Diagnosis: flash-attn failed. TRELLIS can use xformers; '$APP repair' can switch the backend without reinstalling everything."
+  else
+    warn "Diagnosis: unclassified build error. Inspect the last 60 lines below."
+  fi
+  tail -n 60 "$log" 2>/dev/null || true
+}
+
+run_logged(){
+  local stage="$1"; shift
+  local log="$LOG_DIR/build-${stage}-$(date +%Y%m%d-%H%M%S).log"
+  info "[$stage] running; full log: $log"
+  set +e
+  ( "$@" ) 2>&1 | tee "$log"
+  local rc=${PIPESTATUS[0]}
+  set -e
+  if (( rc != 0 )); then record_failure "$stage" "$log" "$rc"; explain_failure "$log" "$rc"; return "$rc"; fi
+  clear_failure; mark_stage "$stage"; ok "[$stage] complete"
+}
+
+ensure_repo(){
+  if [[ -d "$TRELLIS_DIR/.git" ]]; then
+    info "Updating TRELLIS.2 source..."
+    git -C "$TRELLIS_DIR" fetch --all --tags
+    git -C "$TRELLIS_DIR" submodule update --init --recursive
+  else
+    git clone --recursive https://github.com/microsoft/TRELLIS.2.git "$TRELLIS_DIR"
+  fi
+}
+
+install_system(){
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y git build-essential ninja-build cmake python3 python3-venv python3-dev libgl1 libglib2.0-0 libjpeg-dev ffmpeg pkg-config
+  fi
+}
+
+venv_and_torch(){
+  python3 -m venv "$VENV"
+  "$VENV/bin/pip" install -U pip setuptools wheel packaging ninja
+  "$VENV/bin/pip" install torch torchvision --index-url "$TORCH_INDEX_CFG"
+}
+
+basic_deps(){
+  activate
+  pip install imageio imageio-ffmpeg tqdm easydict opencv-python-headless ninja trimesh transformers 'gradio==6.0.1' tensorboard pandas lpips zstandard kornia timm huggingface_hub hf_xet xformers
+  pip install 'git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8'
+  pip install pillow
+}
+
+pip_ext(){
+  local src="$1"
+  activate
+  MAX_JOBS="$MAX_JOBS_CFG" CMAKE_BUILD_PARALLEL_LEVEL="$MAX_JOBS_CFG" NINJA_NUM_JOBS="$MAX_JOBS_CFG" TORCH_CUDA_ARCH_LIST="$ARCH_CFG" pip install "$src" --no-build-isolation
+}
+
+install_nvdiffrast(){ rm -rf /tmp/vt-nvdiffrast; git clone -b v0.4.0 https://github.com/NVlabs/nvdiffrast.git /tmp/vt-nvdiffrast; pip_ext /tmp/vt-nvdiffrast; }
+install_nvdiffrec(){ rm -rf /tmp/vt-nvdiffrec; git clone -b renderutils https://github.com/JeffreyXiang/nvdiffrec.git /tmp/vt-nvdiffrec; pip_ext /tmp/vt-nvdiffrec; }
+install_cumesh(){ rm -rf /tmp/vt-CuMesh; git clone --recursive https://github.com/JeffreyXiang/CuMesh.git /tmp/vt-CuMesh; pip_ext /tmp/vt-CuMesh; }
+install_ovoxel(){ rm -rf /tmp/vt-o-voxel; cp -a "$TRELLIS_DIR/o-voxel" /tmp/vt-o-voxel; pip_ext /tmp/vt-o-voxel; }
+install_flexgemm(){ rm -rf /tmp/vt-FlexGEMM; git clone --recursive https://github.com/JeffreyXiang/FlexGEMM.git /tmp/vt-FlexGEMM; pip_ext /tmp/vt-FlexGEMM; }
+
+install_attention(){
+  activate
+  if [[ "$ATTN_CFG" == xformers ]]; then pip install -U xformers; return; fi
+  if [[ "$ATTN_CFG" == flash_attn_3 ]]; then
+    warn "flash_attn_3 packaging varies by platform. Attempting flash-attn first; use xformers if unsupported."
+  fi
+  MAX_JOBS="$FLASH_JOBS_CFG" CMAKE_BUILD_PARALLEL_LEVEL="$FLASH_JOBS_CFG" NINJA_NUM_JOBS="$FLASH_JOBS_CFG" TORCH_CUDA_ARCH_LIST="$ARCH_CFG" pip install 'flash-attn>=2.8.0' --no-build-isolation
+}
+
+smoke_test(){
+  activate
+  ATTN_BACKEND="$ATTN_CFG" SPARSE_ATTN_BACKEND="$ATTN_CFG" python - <<'PY'
+import torch
+print('torch', torch.__version__, 'cuda', torch.version.cuda)
+assert torch.cuda.is_available(), 'torch cannot see CUDA'
+print('gpu', torch.cuda.get_device_name(0), 'capability', torch.cuda.get_device_capability(0))
+import nvdiffrast.torch
+import o_voxel
+import trellis2
+print('core imports OK')
+PY
+}
+
+cmd_install(){
+  local force=0; [[ "${1:-}" == --force ]] && force=1
+  load_config; ensure_repo
+  if (( force )); then rm -rf "$STAGE_DIR"/*; fi
+  section "Installing TRELLIS.2"
+  stage_done system || run_logged system install_system
+  stage_done torch || run_logged torch venv_and_torch
+  activate
+  stage_done basic || run_logged basic basic_deps
+  stage_done nvdiffrast || run_logged nvdiffrast install_nvdiffrast
+  stage_done nvdiffrec || run_logged nvdiffrec install_nvdiffrec
+  stage_done cumesh || run_logged cumesh install_cumesh
+  stage_done ovoxel || run_logged ovoxel install_ovoxel
+  stage_done flexgemm || run_logged flexgemm install_flexgemm
+  stage_done attention || run_logged attention install_attention
+  stage_done smoke || run_logged smoke smoke_test
+  ok "TRELLIS.2 installation is ready."
+}
+
+cmd_download(){
+  load_config; activate
+  [[ -s "$TOKEN_FILE" ]] || save_token_interactive
+  local token=''
+  [[ -s "$TOKEN_FILE" ]] && token="$(cat "$TOKEN_FILE")"
+  section "Downloading $MODEL_REPO"
+  HF_TOKEN="$token" python - "$MODEL_REPO" <<'PY'
+import os, sys
+from huggingface_hub import snapshot_download
+repo=sys.argv[1]
+kwargs={'repo_id':repo,'resume_download':True}
+t=os.environ.get('HF_TOKEN')
+if t: kwargs['token']=t
+p=snapshot_download(**kwargs)
+print('Model snapshot:', p)
+PY
+}
+
+cmd_launch(){
+  load_config; activate
+  [[ -f "$TRELLIS_DIR/app.py" ]] || die "app.py not found. Run install first."
+  if [[ -s "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then die "TRELLIS app already running (PID $(cat "$PID_FILE"))."; fi
+  export ATTN_BACKEND="$ATTN_CFG" SPARSE_ATTN_BACKEND="$ATTN_CFG" PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+  export GRADIO_SERVER_NAME="0.0.0.0" GRADIO_SERVER_PORT="$PORT" HF_HOME
+  [[ -s "$TOKEN_FILE" ]] && export HF_TOKEN="$(cat "$TOKEN_FILE")"
+  cd "$TRELLIS_DIR"
+  nohup "$VENV/bin/python" app.py > "$APP_LOG" 2>&1 &
+  echo $! > "$PID_FILE"
+  ok "TRELLIS.2 launched (PID $(cat "$PID_FILE"), port $PORT)."
+  info "Log: $APP_LOG"
+}
+
+cmd_status(){
+  if [[ -s "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then ok "App running: PID $(cat "$PID_FILE")"; else warn "App not running."; fi
+  nvidia-smi || true
+}
+cmd_logs(){ [[ -f "$APP_LOG" ]] || die "No app log yet."; tail -n 200 -f "$APP_LOG"; }
+
+cmd_doctor(){
+  load_config
+  cmd_detect
+  section "Environment checks"
+  [[ -d "$TRELLIS_DIR/.git" ]] && ok "TRELLIS repo present" || warn "TRELLIS repo missing"
+  [[ -x "$VENV/bin/python" ]] && ok "Python venv present" || warn "Python venv missing"
+  [[ -n "$(nvcc_cuda || true)" ]] && ok "nvcc toolkit found: $(nvcc_cuda)" || warn "nvcc missing"
+  if [[ -x "$VENV/bin/python" ]]; then
+    set +e
+    ATTN_BACKEND="$ATTN_CFG" SPARSE_ATTN_BACKEND="$ATTN_CFG" "$VENV/bin/python" - <<'PY'
+mods=['torch','xformers','nvdiffrast.torch','o_voxel','trellis2']
+import importlib
+for m in mods:
+    try:
+        x=importlib.import_module(m); print('OK  ',m)
+    except Exception as e: print('FAIL',m,':',repr(e))
+import torch
+print('CUDA available:',torch.cuda.is_available())
+if torch.cuda.is_available():
+    print('GPU:',torch.cuda.get_device_name(0),'cap:',torch.cuda.get_device_capability(0),'torch CUDA:',torch.version.cuda)
+PY
+    set -e
+  fi
+  [[ -s "$FAIL_FILE" ]] && { warn "A previous build failure is recorded:"; cat "$FAIL_FILE"; } || ok "No recorded failed build"
+}
+
+cmd_repair(){
+  load_config
+  [[ -s "$FAIL_FILE" ]] || { ok "No failed build recorded. Running doctor instead."; cmd_doctor; return; }
+  source "$FAIL_FILE"
+  section "Repairing $FAILED_STAGE"
+  local log="${FAILED_LOG:-}"
+  if [[ -f "$log" ]] && grep -qiE 'Killed|out of memory|cannot allocate memory|exit code 137' "$log"; then
+    MAX_JOBS_CFG=1; FLASH_JOBS_CFG=1; save_config
+    rm -f "$STAGE_DIR/$FAILED_STAGE.ok"
+    ok "Build concurrency reduced to 1. Re-run: $APP install"
+  elif [[ "$FAILED_STAGE" == attention ]] || { [[ -f "$log" ]] && grep -qiE 'flash.?attn|flash_attn' "$log"; }; then
+    ATTN_CFG=xformers; INSTALL_FLASH=0; save_config; rm -f "$STAGE_DIR/attention.ok" "$STAGE_DIR/smoke.ok"
+    ok "Attention backend switched to xformers. Re-run: $APP install"
+  elif [[ -f "$log" ]] && grep -qiE 'unsupported gpu architecture|sm_120|compute_120' "$log"; then
+    warn "This is a toolchain/package architecture problem, not a retry problem. For RTX 50 use CUDA 12.8+ with cu128 PyTorch. Current nvcc: $(nvcc_cuda || echo missing)."
+  else
+    warn "No safe automatic repair identified. Build jobs set to 1 and failed stage unlocked."
+    MAX_JOBS_CFG=1; save_config; rm -f "$STAGE_DIR/$FAILED_STAGE.ok"
+  fi
+}
+
+cmd_reset_build(){
+  rm -rf /tmp/vt-* "$HOME/.cache/torch_extensions" 2>/dev/null || true
+  rm -rf "$STAGE_DIR"
+  mkdir -p "$STAGE_DIR"
+  rm -f "$FAIL_FILE"
+  ok "Build caches/stage markers cleared. Hugging Face/model cache preserved."
+}
+
+case "${1:-help}" in
+  wizard) cmd_wizard ;;
+  detect) cmd_detect ;;
+  show) cmd_show ;;
+  install) shift; cmd_install "${1:-}" ;;
+  download) cmd_download ;;
+  launch) cmd_launch ;;
+  status) cmd_status ;;
+  logs) cmd_logs ;;
+  doctor) cmd_doctor ;;
+  repair) cmd_repair ;;
+  reset-build) cmd_reset_build ;;
+  help|-h|--help) usage ;;
+  *) usage; exit 2 ;;
+esac
