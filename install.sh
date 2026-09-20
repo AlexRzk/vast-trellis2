@@ -5,14 +5,25 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEST="${VAST_TRELLIS_INSTALL_PATH:-/usr/local/bin/vast-trellis2}"
 LIB_DIR="${VAST_TRELLIS_LIB_DIR:-/usr/local/lib/vast-trellis2}"
 
-[[ -f "$ROOT_DIR/vast-trellis2" ]] || { echo "ERROR: vast-trellis2 missing" >&2; exit 1; }
-[[ -f "$ROOT_DIR/vast-trellis2-doctor" ]] || { echo "ERROR: vast-trellis2-doctor missing" >&2; exit 1; }
-[[ -f "$ROOT_DIR/scripts/patch_trellis.py" ]] || { echo "ERROR: patch utility missing" >&2; exit 1; }
-[[ -f "$ROOT_DIR/scripts/convert_dinov3_local.py" ]] || { echo "ERROR: DINO converter missing" >&2; exit 1; }
+required=(
+  "$ROOT_DIR/vast-trellis2"
+  "$ROOT_DIR/vast-trellis2-doctor"
+  "$ROOT_DIR/lib/common.sh"
+  "$ROOT_DIR/lib/install.sh"
+  "$ROOT_DIR/lib/runtime.sh"
+  "$ROOT_DIR/scripts/patch_trellis.py"
+  "$ROOT_DIR/scripts/convert_dinov3_local.py"
+)
+for f in "${required[@]}"; do
+  [[ -f "$f" ]] || { echo "ERROR: required file missing: $f" >&2; exit 1; }
+done
 
-mkdir -p "$LIB_DIR/scripts" "$(dirname "$DEST")"
+mkdir -p "$LIB_DIR/lib" "$LIB_DIR/scripts" "$(dirname "$DEST")"
 install -m 0755 "$ROOT_DIR/vast-trellis2" "$DEST"
 install -m 0755 "$ROOT_DIR/vast-trellis2-doctor" "$LIB_DIR/vast-trellis-doctor"
+install -m 0644 "$ROOT_DIR/lib/common.sh" "$LIB_DIR/lib/common.sh"
+install -m 0644 "$ROOT_DIR/lib/install.sh" "$LIB_DIR/lib/install.sh"
+install -m 0644 "$ROOT_DIR/lib/runtime.sh" "$LIB_DIR/lib/runtime.sh"
 install -m 0755 "$ROOT_DIR/scripts/patch_trellis.py" "$LIB_DIR/scripts/patch_trellis.py"
 install -m 0755 "$ROOT_DIR/scripts/convert_dinov3_local.py" "$LIB_DIR/scripts/convert_dinov3_local.py"
 
@@ -31,6 +42,7 @@ Start here:
 
 Useful commands:
   vast-trellis2 detect
+  vast-trellis2 install
   vast-trellis2 doctor
   vast-trellis2 doctor --fix
   vast-trellis2 auth
@@ -41,5 +53,5 @@ Useful commands:
   vast-trellis2 tunnel
 
 The wizard detects effective cgroup RAM (not just host RAM), GPU VRAM/compute
-capability, CUDA Toolkit, and CPU count before selecting build concurrency.
+capability, CUDA Toolkit, CPU count and safe CUDA build concurrency.
 EOF
