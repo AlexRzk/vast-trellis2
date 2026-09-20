@@ -10,6 +10,7 @@ required=(
   "$ROOT_DIR/vast-trellis2-doctor"
   "$ROOT_DIR/lib/common.sh"
   "$ROOT_DIR/lib/install.sh"
+  "$ROOT_DIR/lib/download.sh"
   "$ROOT_DIR/lib/runtime.sh"
   "$ROOT_DIR/scripts/patch_trellis.py"
   "$ROOT_DIR/scripts/convert_dinov3_local.py"
@@ -23,6 +24,7 @@ install -m 0755 "$ROOT_DIR/vast-trellis2" "$DEST"
 install -m 0755 "$ROOT_DIR/vast-trellis2-doctor" "$LIB_DIR/vast-trellis-doctor"
 install -m 0644 "$ROOT_DIR/lib/common.sh" "$LIB_DIR/lib/common.sh"
 install -m 0644 "$ROOT_DIR/lib/install.sh" "$LIB_DIR/lib/install.sh"
+install -m 0644 "$ROOT_DIR/lib/download.sh" "$LIB_DIR/lib/download.sh"
 install -m 0644 "$ROOT_DIR/lib/runtime.sh" "$LIB_DIR/lib/runtime.sh"
 install -m 0755 "$ROOT_DIR/scripts/patch_trellis.py" "$LIB_DIR/scripts/patch_trellis.py"
 install -m 0755 "$ROOT_DIR/scripts/convert_dinov3_local.py" "$LIB_DIR/scripts/convert_dinov3_local.py"
@@ -47,6 +49,8 @@ Useful commands:
   vast-trellis2 doctor --fix
   vast-trellis2 auth
   vast-trellis2 download
+  vast-trellis2 download --direct
+  vast-trellis2 hf-speedtest
   vast-trellis2 run
   vast-trellis2 start
   vast-trellis2 status
