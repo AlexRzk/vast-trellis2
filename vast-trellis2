@@ -11,7 +11,7 @@ else
   TOOL_ROOT="$LIB_DIR"
 fi
 
-for f in common.sh install.sh runtime.sh; do
+for f in common.sh install.sh download.sh runtime.sh; do
   [[ -f "$TOOL_ROOT/lib/$f" ]] || { echo "ERROR: missing $TOOL_ROOT/lib/$f. Re-run install.sh." >&2; exit 1; }
 done
 
@@ -19,6 +19,9 @@ done
 source "$TOOL_ROOT/lib/common.sh"
 # shellcheck disable=SC1091
 source "$TOOL_ROOT/lib/install.sh"
+# download.sh intentionally overrides cmd_download from install.sh.
+# shellcheck disable=SC1091
+source "$TOOL_ROOT/lib/download.sh"
 # shellcheck disable=SC1091
 source "$TOOL_ROOT/lib/runtime.sh"
 
@@ -34,6 +37,7 @@ case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   auth|login) shift; cmd_auth "$@" ;;
   download) shift; cmd_download "$@" ;;
+  hf-speedtest) shift; cmd_hf_speedtest "$@" ;;
   dino-local) shift; cmd_dino_local "$@" ;;
   run) shift; run_foreground "$@" ;;
   start|launch) shift; cmd_start "$@" ;;
