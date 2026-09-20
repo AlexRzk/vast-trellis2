@@ -84,8 +84,13 @@ cmd_detect(){
   printf 'Compute capability:   %s\nDriver:               %s\nDriver CUDA support:  %s\nnvcc toolkit:         %s\n' "$(gpu_cc)" "$(driver_ver)" "$(host_cuda)" "$(nvcc_cuda || true)"
   printf 'System RAM:           %s GB\nAvailable RAM:        %s GB\nCPU threads:          %s\nFree disk:            %s GB\n' "$(ram_total_gb)" "$(ram_avail_gb)" "$(cpu_count)" "$(disk_free_gb)"
   printf '\nRecommended jobs:     %s\nFlash-attn jobs:      %s\nCUDA arch list:       %s\nPyTorch index:        %s\nAttention backend:    %s\n' "$AUTO_JOBS" "$FLASH_JOBS" "$ARCH_LIST" "$TORCH_INDEX" "$AUTO_ATTN"
-  (( vm < 24 )) && warn "TRELLIS.2 documents >=24 GB VRAM; this GPU has about ${vm} GB."
-  [[ -z "$(nvcc_cuda || true)" ]] && warn "nvcc is missing. CUDA extensions need a toolkit/devel image, not only a runtime image."
+  if (( vm < 24 )); then
+    warn "TRELLIS.2 documents >=24 GB VRAM; this GPU has about ${vm} GB."
+  fi
+  if [[ -z "$(nvcc_cuda || true)" ]]; then
+    warn "nvcc is missing. CUDA extensions need a toolkit/devel image, not only a runtime image."
+  fi
+  return 0
 }
 cmd_show(){ load_config; section "Configuration"; printf 'TRELLIS directory: %s\nVenv:              %s\nHF home:           %s\nBuild jobs:        %s\nFlash jobs:        %s\nTorch index:       %s\nCUDA arch:         %s\nAttention backend: %s\nModel:             %s\nPort:              %s\nHF token:          %s\n' "$TRELLIS_DIR" "$VENV" "$HF_HOME" "$MAX_JOBS_CFG" "$FLASH_JOBS_CFG" "$TORCH_INDEX_CFG" "$ARCH_CFG" "$ATTN_CFG" "$MODEL_REPO" "$PORT" "$([[ -s "$TOKEN_FILE" ]] && echo configured || echo not-configured)"; }
 save_token_interactive(){ local t; printf 'Paste Hugging Face token (input hidden; blank keeps existing): '; read -r -s t || true; echo; if [[ -n "$t" ]]; then umask 077; printf '%s' "$t" > "$TOKEN_FILE"; chmod 600 "$TOKEN_FILE"; ok "Hugging Face token saved securely."; fi; }
